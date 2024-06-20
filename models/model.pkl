@@ -1,0 +1,154 @@
+const express = require('express');
+const firebaseAdmin = require('firebase-admin');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const axios = require('axios');
+require('dotenv').config();
+
+const serviceAccount = require('./firebaseServiceAccountKey.json');
+
+firebaseAdmin.initializeApp({
+  credential: firebaseAdmin.credential.cert(serviceAccount),
+  databaseURL: `https://${process.env.FIREBASE_PROJECT_ID}.firebaseio.com` // Ganti dengan ID proyek Firebase Anda
+});
+
+const db = firebaseAdmin.firestore();
+const app = express();
+
+app.use(cors());
+app.use(bodyParser.json());
+
+const authenticateToken = async (req, res, next) => {
+  const idToken = req.headers.authorization;
+
+  if (!idToken || !idToken.startsWith('Bearer ')) {
+    return res.status(401).send('Unauthorized - Invalid or missing token format');
+  }
+
+  const token = idToken.split('Bearer ')[1]; // Ambil bagian token setelah 'Bearer '
+
+  try {
+    const decodedToken = await firebaseAdmin.auth().verifyIdToken(token);
+    req.user = decodedToken; // Menyimpan informasi user yang di-decode dalam request
+    next(); // Lanjut ke handler berikutnya
+  } catch (error) {
+    console.error('Error verifying token:', error);
+    return res.status(401).send('Unauthorized - Invalid token');
+  }
+};
+
+
+
+// User Registration
+app.post('/register', async (req, res) => {
+  const { email, password, confirmPassword } = req.body;
+
+  // Validasi konfirmasi password
+  if (password !== confirmPassword) {
+    return res.status(400).send("Passwords do not match.");
+  }
+
+  try {
+    const userRecord = await firebaseAdmin.auth().createUser({
+      email: email,
+      password: password,
+    });
+
+    res.status(201).send(userRecord);
+  } catch (error) {
+    res.status(400).send(error.message);
+  }
+});
+
+
+
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    // Gunakan Firebase Authentication REST API untuk verifikasi email dan password
+    const response = await axios.post(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${process.env.FIREBASE_API_KEY}`, {
+      email: email,
+      password: password,
+      returnSecureToken: true
+    });
+
+    const idToken = response.data.idToken;
+    const customToken = await firebaseAdmin.auth().createCustomToken(response.data.localId);
+    res.status(200).send({ token: customToken, idToken: idToken });
+  } catch (error) {
+    res.status(400).send(error.response.data.error.message);
+  }
+});
+
+// Logout (this typically is handled client-side by simply deleting the token)
+app.post('/logout', (req, res) => {
+  // Since we are not managing sessions, just respond with success.
+  res.status(200).send('Logged out successfully');
+});
+
+// Get Books with Filters
+app.get('/books', authenticateToken, async (req, res) => {
+  const { age, rating, genre, author, title } = req.query;
+  let query = db.collection('books');
+
+  if (age) query = query.where('age', '==', age);
+  if (rating) query = query.where('rating', '==', rating);
+  if (genre) query = query.where('genre', '==', genre);
+  if (author) query = query.where('author', '==', author);
+  if (title) query = query.where('title', '==', title);
+
+  try {
+    const snapshot = await query.get();
+    if (snapshot.empty) {
+      return res.status(404).send('No matching books found.');
+    }
+
+    const books = [];
+    snapshot.forEach(doc => {
+      books.push(doc.data());
+    });
+
+    // Call your model prediction endpoint with filter parameters
+    const modelResponse = await axios.post('url model', {
+      age,
+      rating,
+      genre,
+      author,
+      title
+    });
+
+    // Save the model prediction result to Firestore
+    const predictionResult = modelResponse.data;
+    await db.collection('predictions').add({
+      filters: { age, rating, genre, author, title },
+      result: predictionResult,
+      timestamp: firebaseAdmin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.status(200).send({books, prediction: predictionResult});
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+// Get Book Details
+app.get('/books/:id', authenticateToken, async (req, res) => {
+  const bookId = req.params.id;
+  try {
+    const bookRef = db.collection('books').doc(bookId);
+    const doc = await bookRef.get();
+    if (!doc.exists) {
+      return res.status(404).send('Book not found');
+    }
+    res.status(200).send(doc.data());
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+// Start Server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
